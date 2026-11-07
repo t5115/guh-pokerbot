@@ -10,10 +10,12 @@ from fh_features import encode_state_dict
 from fh_network import Network
 from fh_shortstack import _push_fold
 from fh_weights import load_arrays
+import fh_exploit
 
 
 class Model:
-    def __init__(self, random_seed=20261107, use_shortstack_chart=True):
+    def __init__(self, random_seed=20261107, use_shortstack_chart=True,
+                 use_exploits=True):
         arrays = load_arrays()
         self.equity_tables = tuple(arrays.pop(k) for k in ('paired', 'suited', 'offsuit'))
         arrays['_model_type'] = ('average_strategy' if 'strategy_w0' in arrays else 'advantage')
@@ -27,6 +29,12 @@ class Model:
         self.last_strategy = None
         self.hand = []
         self.player_id = None
+        # Learned across hands (seed never resets these): team -> stats.
+        self.use_exploits = use_exploits
+        self.exploit_kinds = ('shover', 'station', 'nit', 'cardblind')
+        self.opp_stats = {}
+        self.exploit_calls = {}
+        self.tracker = fh_exploit.new_tracker()
 
     def seed(self, hand, player_id):
         self.hand = list(hand)
@@ -37,6 +45,34 @@ class Model:
         self.history_last_raise = 0
         self.n_raises = 0
         self.last_raiser = None
+        self.tracker = fh_exploit.new_tracker()
+
+    def _track(self, actions, game_state):
+        try:
+            if not self.tracker['ready'] and game_state.street == 'preflop':
+                fh_exploit.start_tracker(self.tracker, game_state)
+            fh_exploit.process(self.tracker, self.opp_stats, self.player_id,
+                               actions, list(game_state.teams))
+        except Exception:
+            self.tracker = {'ready': False, 'broken': True}
+
+    def _exploit(self, game_state):
+        if not self.use_exploits or self.tracker.get('broken'):
+            return None
+        opps = [p for p in game_state.players_in_hand if p != self.player_id]
+        if len(opps) != 1:
+            return None
+        kind = fh_exploit.profile(self.opp_stats.get(game_state.teams[opps[0]]))
+        if kind is None or kind not in self.exploit_kinds:
+            return None
+        try:
+            action = fh_exploit.decide(kind, self, game_state, PlayerAction)
+            if action is not None:
+                game_state.validate_action(action)
+                self.exploit_calls[kind] = self.exploit_calls.get(kind, 0) + 1
+            return action
+        except Exception:
+            return None
 
     def _observe(self, actions, game_state):
         if self.initial_stacks is None:
@@ -115,6 +151,10 @@ class Model:
         if not 2 <= game_state.num_players <= 6:
             raise ValueError('This checkpoint supports two to six seats')
         self._observe(actions, game_state)
+        self._track(actions, game_state)
+        exploit = self._exploit(game_state)
+        if exploit is not None:
+            return exploit
         state = self.encode_public_state(game_state)
         if self.use_shortstack_chart and game_state.street == 'preflop':
             chart = _push_fold(state)
@@ -151,4 +191,15 @@ class Model:
         return self._raise(game_state, game_state.current_bet + increment)
 
     def end_game(self, actions, game_state):
-        pass
+        if not self.use_exploits:
+            return
+        try:
+            teams = list(game_state.teams)
+            if self.tracker.get('broken'):
+                self.tracker = fh_exploit.new_tracker()
+            fh_exploit.process(self.tracker, self.opp_stats, self.player_id,
+                               actions, teams)
+            fh_exploit.finish_hand(self.tracker, self.opp_stats, self.player_id,
+                                   self.equity_tables, teams)
+        except Exception:
+            pass
