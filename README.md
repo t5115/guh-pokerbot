@@ -1,3 +1,5 @@
+Submission by last minute push team for great uni hack!
+
 # Poker bot hackathon
 
 Write a bot that plays no-limit Texas hold'em. Your bot is a `Model` in
